@@ -1,10 +1,8 @@
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::Span
 use quote::quote;
 use syn::{
-    parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DataStruct,
-    DeriveInput, Field, Fields, FieldsNamed, GenericArgument, Ident, Path, PathArguments, Token,
-    Type, TypePath,
+    parse_macro_input, punctuated::Punctuated, Lit, AngleBracketedGenericArguments, Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Field, Fields, FieldsNamed, GenericArgument, Ident, MetaNameValue, Path, PathArguments, Token, Type, TypePath
 };
 
 #[proc_macro_derive(Builder, attributes(builder))]
@@ -14,12 +12,13 @@ pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
     let mut builder_tokens = proc_macro2::TokenStream::new();
     let mut build_tokens = proc_macro2::TokenStream::new(); // for builder's build method
 
+    let attributes = input.attrs;
     if let Data::Struct(DataStruct {
         fields: Fields::Named(FieldsNamed { ref named, .. }),
         ..
     }) = input.data
     {
-        let (builder, build_struct_fields) = derive_builder_implementation(named);
+        let (builder, build_struct_fields) = derive_builder_implementation(named, &attributes);
 
         if !builder.is_empty() {
             builder_tokens = quote! {
@@ -75,6 +74,7 @@ pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
 
 fn derive_builder_implementation(
     named: &Punctuated<Field, Token![,]>,
+    attributes: &Vec<Attribute>,
 ) -> (Vec<proc_macro2::TokenStream>, Vec<proc_macro2::TokenStream>) {
     let mut builder = Vec::new();
     let mut build_fields = Vec::new();
@@ -105,7 +105,28 @@ fn derive_builder_implementation(
             }
         }
 
-        builder.push(generate_build_method(ident, &option_inner_type, ty));
+        // TODO: validate the each="" decorates a Vec<T>. and we also need to extract the T out of Vec.
+        let literal =
+            if let Some(attribute) = field.attrs.iter().next() {
+                if let syn::Meta::NameValue(MetaNameValue { path, value: Expr::Lit(lit), ..}) = &attribute.meta {
+                    if let Some(ident) = path.get_ident() {
+                        if ident != "each" {
+                            panic!("We don't this #[builder] attribute: {}", ident);
+                        }
+
+                        Some(lit.lit.clone())
+                    } else {
+                        // don't want to deal with bare attributes.
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        builder.push(generate_build_method(ident, &option_inner_type, ty, &literal));
         build_fields.push(generate_build_struct_field(ident, &option_inner_type));
     }
 
@@ -116,6 +137,7 @@ fn generate_build_method(
     ident: &Ident,
     option_inner_type: &Option<GenericArgument>,
     ty: &Type,
+    each_literal: &Option<Lit>
 ) -> proc_macro2::TokenStream {
     if let Some(option) = option_inner_type {
         quote! {
@@ -126,10 +148,10 @@ fn generate_build_method(
         }
     } else {
         quote! {
-        fn #ident(&mut self, #ident: #ty) -> &mut Self {
-            self.#ident = Some(#ident);
-            self
-        }
+            fn #ident(&mut self, #ident: #ty) -> &mut Self {
+                self.#ident = Some(#ident);
+                self
+            }
         }
     }
 }
