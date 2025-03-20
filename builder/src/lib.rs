@@ -1,97 +1,38 @@
-use proc_macro2::Span;
-use syn::{parse_macro_input, AngleBracketedGenericArguments, Data, DataStruct, DeriveInput, Fields, FieldsNamed, GenericArgument, Ident, Path, PathArguments, Type, TypePath};
-use quote::quote;
 use proc_macro::TokenStream;
+use proc_macro2::Span;
+use quote::quote;
+use syn::{
+    parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DataStruct,
+    DeriveInput, Field, Fields, FieldsNamed, GenericArgument, Ident, Path, PathArguments, Token,
+    Type, TypePath,
+};
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    let mut builder = Vec::new();
-    let mut fields_list = Vec::new();
+    let mut builder_tokens = proc_macro2::TokenStream::new();
+    let mut build_tokens = proc_macro2::TokenStream::new(); // for builder's build method
 
     if let Data::Struct(DataStruct {
         fields: Fields::Named(FieldsNamed { ref named, .. }),
         ..
     }) = input.data
     {
-        for field in named {
-            let ident = field.ident.as_ref().unwrap();
-            let ty = &field.ty;
+        let (builder, build_struct_fields) = derive_builder_implementation(named);
 
-            let mut option_inner_type: Option<GenericArgument> = None;
-            if let Type::Path(TypePath {
-                path: Path { 
-                    segments,
-                    ..
-                },
-                ..
-            }) = ty {
-                let option = Ident::new("Option", Span::call_site());
-                for segment in segments {
-                    if segment.ident == option {
-                        if let PathArguments::AngleBracketed(AngleBracketedGenericArguments { 
-                            args,
-                            ..
-                        })= &segment.arguments {
-                            for arg in args {
-                                option_inner_type = Some(arg.clone());
-                                break;
-                            }
-                        }
-                    }
-                    break; // First level is enough
-                }
-            }
-
-           let expanded = 
-            if let Some(ref option) = option_inner_type {
-                quote! {
-                    fn #ident(&mut self, #ident: #option) -> &mut Self {
-                        self.#ident = Some(#ident);
-                        self
-                    }
-                }
-            } else {
-                quote! {
-                fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                    self.#ident = Some(#ident);
-                    self
-                }
-                }
+        if !builder.is_empty() {
+            builder_tokens = quote! {
+                #(#builder)*
             };
-            builder.push(expanded);
+        };
 
-            let expanded = if let Some(ref _option) = option_inner_type {
-                quote! {
-                    #ident: self.#ident.clone(),
-                }
-            } else {
-                quote! {
-                    #ident: self.#ident.take().ok_or_else(|| Box::<dyn std::error::Error>::from("ident is not set.".to_string()))?,
-                }
+        if !build_struct_fields.is_empty() {
+            build_tokens = quote! {
+                #(#build_struct_fields)*
             };
-            fields_list.push(expanded);
-        }
+        };
     }
-
-    let builder_impl = if !builder.is_empty() {
-        quote! {
-            #(#builder)*
-        }
-    } else {
-        quote! {}
-    };
-
-    let build_impl = if !fields_list.is_empty() {
-        quote! {
-            #(#fields_list)*
-        }
-    } else {
-        quote! {}
-    };
-
-    // println!("{}", build_impl);
 
     let generics = input.generics;
     let ident = input.ident;
@@ -119,15 +60,91 @@ pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
         }
 
         impl #builder_type_name_ident {
-            #builder_impl
+            #builder_tokens
 
             pub fn build(&mut self) -> Result<#ident, Box<dyn Error>> {
                 Ok(#ident {
-                    #build_impl
+                    #build_tokens
                 })
             }
         }
-    };    
+    };
 
     TokenStream::from(tokens)
+}
+
+fn derive_builder_implementation(
+    named: &Punctuated<Field, Token![,]>,
+) -> (Vec<proc_macro2::TokenStream>, Vec<proc_macro2::TokenStream>) {
+    let mut builder = Vec::new();
+    let mut build_fields = Vec::new();
+
+    for field in named {
+        let ident = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+
+        let mut option_inner_type = None;
+        if let Type::Path(TypePath {
+            path: Path { segments, .. },
+            ..
+        }) = ty
+        {
+            let option = Ident::new("Option", Span::call_site());
+            if let Some(segment) = segments.into_iter().next() {
+                if segment.ident == option {
+                    if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                        args,
+                        ..
+                    }) = &segment.arguments
+                    {
+                        if let Some(arg) = args.into_iter().next() {
+                            option_inner_type = Some(arg.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        builder.push(generate_build_method(ident, &option_inner_type, ty));
+        build_fields.push(generate_build_struct_field(ident, &option_inner_type));
+    }
+
+    (builder, build_fields)
+}
+
+fn generate_build_method(
+    ident: &Ident,
+    option_inner_type: &Option<GenericArgument>,
+    ty: &Type,
+) -> proc_macro2::TokenStream {
+    if let Some(option) = option_inner_type {
+        quote! {
+            fn #ident(&mut self, #ident: #option) -> &mut Self {
+                self.#ident = Some(#ident);
+                self
+            }
+        }
+    } else {
+        quote! {
+        fn #ident(&mut self, #ident: #ty) -> &mut Self {
+            self.#ident = Some(#ident);
+            self
+        }
+        }
+    }
+}
+
+fn generate_build_struct_field(
+    ident: &Ident,
+    option_inner_type: &Option<GenericArgument>,
+) -> proc_macro2::TokenStream {
+    if let Some(_option) = option_inner_type {
+        quote! {
+            #ident: self.#ident.clone(),
+        }
+    } else {
+        quote! {
+            #ident: self.#ident.take().ok_or_else(|| Box::<dyn std::error::Error>::from("ident is not set.".to_string()))?,
+        }
+    }
 }
