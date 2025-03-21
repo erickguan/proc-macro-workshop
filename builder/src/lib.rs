@@ -1,9 +1,7 @@
 use proc_macro::TokenStream;
-use proc_macro2::Span
+use proc_macro2::Span;
 use quote::quote;
-use syn::{
-    parse_macro_input, punctuated::Punctuated, Lit, AngleBracketedGenericArguments, Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, Field, Fields, FieldsNamed, GenericArgument, Ident, MetaNameValue, Path, PathArguments, Token, Type, TypePath
-};
+use syn::{punctuated::Punctuated, *};
 
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
@@ -12,13 +10,12 @@ pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
     let mut builder_tokens = proc_macro2::TokenStream::new();
     let mut build_tokens = proc_macro2::TokenStream::new(); // for builder's build method
 
-    let attributes = input.attrs;
     if let Data::Struct(DataStruct {
         fields: Fields::Named(FieldsNamed { ref named, .. }),
         ..
     }) = input.data
     {
-        let (builder, build_struct_fields) = derive_builder_implementation(named, &attributes);
+        let (builder, build_struct_fields) = derive_builder_implementation(named);
 
         if !builder.is_empty() {
             builder_tokens = quote! {
@@ -51,8 +48,8 @@ pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
             pub fn builder() -> #builder_type_name_ident {
                 #builder_type_name_ident {
                     executable: None,
-                    args: None,
-                    env: None,
+                    args: Some(Vec::new()),
+                    env: Some(Vec::new()),
                     current_dir: None,
                 }
             }
@@ -74,7 +71,6 @@ pub fn derive_builder_macro(input: TokenStream) -> TokenStream {
 
 fn derive_builder_implementation(
     named: &Punctuated<Field, Token![,]>,
-    attributes: &Vec<Attribute>,
 ) -> (Vec<proc_macro2::TokenStream>, Vec<proc_macro2::TokenStream>) {
     let mut builder = Vec::new();
     let mut build_fields = Vec::new();
@@ -83,74 +79,117 @@ fn derive_builder_implementation(
         let ident = field.ident.as_ref().unwrap();
         let ty = &field.ty;
 
-        let mut option_inner_type = None;
+        let mut generic_inner_type = None;
         if let Type::Path(TypePath {
             path: Path { segments, .. },
             ..
         }) = ty
         {
-            let option = Ident::new("Option", Span::call_site());
             if let Some(segment) = segments.into_iter().next() {
-                if segment.ident == option {
-                    if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
-                        args,
-                        ..
-                    }) = &segment.arguments
-                    {
-                        if let Some(arg) = args.into_iter().next() {
-                            option_inner_type = Some(arg.clone());
-                        }
-                    }
+                // segment.ident could be Option<>, Vec<>
+                if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                    args, ..
+                }) = &segment.arguments
+                {
+                    generic_inner_type = Some((segment.ident.to_string(), args.clone()));
                 }
             }
         }
 
-        // TODO: validate the each="" decorates a Vec<T>. and we also need to extract the T out of Vec.
-        let literal =
-            if let Some(attribute) = field.attrs.iter().next() {
-                if let syn::Meta::NameValue(MetaNameValue { path, value: Expr::Lit(lit), ..}) = &attribute.meta {
-                    if let Some(ident) = path.get_ident() {
-                        if ident != "each" {
-                            panic!("We don't this #[builder] attribute: {}", ident);
-                        }
+        let literal = if let Some(attribute) = field.attrs.first() {
+            extract_attribute_literal(attribute)
+        } else {
+            None
+        };
 
-                        Some(lit.lit.clone())
-                    } else {
-                        // don't want to deal with bare attributes.
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-        builder.push(generate_build_method(ident, &option_inner_type, ty, &literal));
-        build_fields.push(generate_build_struct_field(ident, &option_inner_type));
+        let builder_method = generate_builder_method(ident, &generic_inner_type, ty, &literal);
+        // fs::write(format!("/tmp/builder_method_{}", ident), builder_method.to_string());
+        builder.push(builder_method);
+        let build_field = generate_build_struct_field(ident, &generic_inner_type);
+        // fs::write(format!("/tmp/build_field_{}", ident), build_field.to_string());
+        build_fields.push(build_field);
     }
 
     (builder, build_fields)
 }
 
-fn generate_build_method(
-    ident: &Ident,
-    option_inner_type: &Option<GenericArgument>,
-    ty: &Type,
-    each_literal: &Option<Lit>
-) -> proc_macro2::TokenStream {
-    if let Some(option) = option_inner_type {
-        quote! {
-            fn #ident(&mut self, #ident: #option) -> &mut Self {
-                self.#ident = Some(#ident);
-                self
+fn extract_attribute_literal(attribute: &Attribute) -> Option<String> {
+    if let syn::Meta::List(MetaList { tokens, .. }) = &attribute.meta {
+        match parse2::<MetaNameValue>(tokens.clone()) {
+            Ok(pair) => {
+                if let Some(ident) = pair.path.get_ident() {
+                    if ident != "each" {
+                        eprintln!("Unknown attribute {}", ident);
+                    }
+                } else {
+                    eprintln!("Failed to get ident");
+                }
+
+                match pair.value {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(ls), ..
+                    }) => {
+                        let value = ls.value();
+                        return Some(value);
+                    }
+                    _ => {
+                        eprintln!("Unknown value");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to parse MetaNameValue: {}", e);
             }
         }
-    } else {
-        quote! {
-            fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                self.#ident = Some(#ident);
-                self
+    }
+
+    None
+}
+
+fn generate_builder_method(
+    ident: &Ident,
+    generic_inner_type: &Option<(String, Punctuated<GenericArgument, token::Comma>)>,
+    ty: &Type,
+    each_literal: &Option<String>,
+) -> proc_macro2::TokenStream {
+    match generic_inner_type {
+        Some((generic, args)) if generic == "Option" => {
+            quote! {
+                fn #ident(&mut self, #ident: #args) -> &mut Self {
+                    self.#ident = Some(#ident);
+                    self
+                }
+            }
+        }
+        Some((generic, args)) if generic == "Vec" => {
+            if let Some(arg_literal) = each_literal {
+                let item_ident = Ident::new(arg_literal, Span::call_site());
+
+                quote! {
+                    fn #item_ident(&mut self, #item_ident: #args) -> &mut Self {
+                        self.#ident.as_mut().unwrap().push(#item_ident);
+                        self
+                    }
+                }
+            } else {
+                quote! {
+                    fn #ident(&mut self, #ident: #ty) -> &mut Self {
+                        self.#ident = Some(#ident);
+                        self
+                    }
+                }
+            }
+        }
+        Some((generic, _args)) => {
+            eprintln!("Unknown generic type {}", generic);
+            quote! {}
+        }
+        None => {
+            quote! {
+                fn #ident(&mut self, #ident: #ty) -> &mut Self {
+                    self.#ident = Some(#ident);
+                    self
+                }
             }
         }
     }
@@ -158,15 +197,19 @@ fn generate_build_method(
 
 fn generate_build_struct_field(
     ident: &Ident,
-    option_inner_type: &Option<GenericArgument>,
+    generic_inner_type: &Option<(String, Punctuated<GenericArgument, token::Comma>)>,
 ) -> proc_macro2::TokenStream {
-    if let Some(_option) = option_inner_type {
-        quote! {
-            #ident: self.#ident.clone(),
+    match generic_inner_type {
+        Some((generic, _args)) if generic == "Option" => {
+            quote! {
+                #ident: self.#ident.clone(),
+            }
         }
-    } else {
-        quote! {
-            #ident: self.#ident.take().ok_or_else(|| Box::<dyn std::error::Error>::from("ident is not set.".to_string()))?,
+        _ => {
+            let identifier = ident.to_string();
+            quote! {
+                #ident: self.#ident.take().ok_or_else(|| Box::<dyn std::error::Error>::from(format!("{} is not set.", #identifier)))?,
+            }
         }
     }
 }
